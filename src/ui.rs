@@ -14,7 +14,7 @@ use gpui::{
 
 use crate::claude::{self, LaunchTarget};
 use crate::config::{Config, LaunchConfig, ProfileConfig};
-use crate::profiles::{LiveState, ProfileContents, ProfileManager, SwitchOutcome};
+use crate::profiles::{HistoryStatus, LiveState, ProfileContents, ProfileManager, SwitchOutcome};
 use crate::tray::{TrayAction, TrayController};
 use crate::dither::{self, Glyph, Sky, SkyFrame};
 use crate::{icon, logging, paths, process, startup};
@@ -76,6 +76,7 @@ struct Snapshot {
     contents_taken: Instant,
     profiles: Vec<ProfileFacts>,
     link: LinkHealth,
+    history: HistoryStatus,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -84,6 +85,27 @@ struct ProfileFacts {
     cli_auth: bool,
     desktop_account: Option<String>,
     contents: ProfileContents,
+}
+
+impl ProfileFacts {
+    /// Code sessions this account lists in Desktop: its own folder when it has signed in,
+    /// otherwise the fullest folder it holds.
+    fn sessions(&self) -> usize {
+        let own = self.desktop_account.as_deref().and_then(|id| {
+            self.contents
+                .accounts
+                .iter()
+                .find(|account| account.account_uuid == id)
+        });
+        own.map(|account| account.sessions).unwrap_or_else(|| {
+            self.contents
+                .accounts
+                .iter()
+                .map(|account| account.sessions)
+                .max()
+                .unwrap_or(0)
+        })
+    }
 }
 
 const CONTENTS_REFRESH: Duration = Duration::from_secs(10);
@@ -125,6 +147,9 @@ pub struct DashboardView {
     snapshot: Option<Snapshot>,
     sky: SkyState,
     data: data::DataState,
+    /// The "bring my history over" preview is open and waiting for a yes.
+    history_confirm: bool,
+    show_advanced: bool,
 }
 
 impl DashboardView {
@@ -167,6 +192,8 @@ impl DashboardView {
                 was_visible: false,
             },
             data: data::DataState::default(),
+            history_confirm: false,
+            show_advanced: false,
         }
     }
 
@@ -232,12 +259,23 @@ impl DashboardView {
                 }
             })
             .collect();
+        let history = reusable
+            .map(|snap| snap.history)
+            .unwrap_or_else(|| self.manager.history_status());
         self.snapshot = Some(Snapshot {
             taken: Instant::now(),
             contents_taken,
             profiles,
             link: self.link_health(),
+            history,
         });
+    }
+
+    fn history(&self) -> HistoryStatus {
+        self.snapshot
+            .as_ref()
+            .map(|snap| snap.history)
+            .unwrap_or_default()
     }
 
     fn facts(&self, index: usize) -> ProfileFacts {
@@ -628,55 +666,115 @@ impl DashboardView {
         cx.notify();
     }
 
-    fn toggle_share_sessions(&mut self, cx: &mut Context<Self>) {
-        self.cfg.share_sessions = !self.cfg.share_sessions;
-        self.cfg.save();
-        self.reload_manager();
-        self.set_banner(
-            BannerKind::Success,
-            if self.cfg.share_sessions {
-                "Code sessions will be shared across all accounts on every switch."
-            } else {
-                "Code sessions are no longer shared across accounts."
-            },
-        );
+    /// The "same Code history in every account" switch. Turning it off is immediate. Turning
+    /// it on is immediate when the accounts already match; otherwise it opens a preview of
+    /// what each account will receive and waits for a yes.
+    fn toggle_history(&mut self, cx: &mut Context<Self>) {
+        if self.cfg.share_sessions {
+            self.cfg.share_sessions = false;
+            self.cfg.save();
+            self.reload_manager();
+            self.set_banner(
+                BannerKind::Info,
+                "Each account keeps its own Code history from now on. Sessions already shared stay.",
+            );
+        } else if self.history().in_sync {
+            self.cfg.share_sessions = true;
+            self.cfg.save();
+            self.reload_manager();
+            self.set_banner(
+                BannerKind::Success,
+                "Every account already shows the same Code history. It stays that way on each switch.",
+            );
+        } else {
+            self.history_confirm = !self.history_confirm;
+        }
         cx.notify();
     }
 
-    fn sync_sessions_now(&mut self, cx: &mut Context<Self>) {
-        if !process::find_claude_desktop().is_empty() {
-            self.set_banner(
-                BannerKind::Warning,
-                "Close Claude Desktop first, then sync Code sessions.",
-            );
-            cx.notify();
+    /// Copies Code history into every account. Desktop has to be closed while the files
+    /// move, so it is closed and reopened when it was running. `enable` also turns the
+    /// setting on, and turns it back off if the sync could not run at all.
+    fn trigger_history_sync(&mut self, enable: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy_message.is_some() {
             return;
         }
-        match self.manager.sync_sessions(true) {
-            Ok(report) if report.failed > 0 => self.set_banner(
-                BannerKind::Warning,
-                format!(
-                    "Shared Code sessions, but {} file(s) could not be written; see the log.",
-                    report.failed
-                ),
-            ),
-            Ok(report) if report.copied + report.removed == 0 => self.set_banner(
-                BannerKind::Success,
-                "Code sessions are already the same in every account.",
-            ),
-            Ok(report) => self.set_banner(
-                BannerKind::Success,
-                format!(
-                    "Shared Code sessions: {} copied, {} removed. A backup was saved first.",
-                    report.copied, report.removed
-                ),
-            ),
-            Err(err) => self.set_banner(
-                BannerKind::Error,
-                format!("Could not share Code sessions: {err}"),
-            ),
+        self.history_confirm = false;
+        if enable {
+            self.cfg.share_sessions = true;
+            self.cfg.save();
+            self.reload_manager();
         }
+        self.busy_message = Some("Bringing Code history into every account…".into());
         cx.notify();
+
+        let target = self.manager.launch_target().clone();
+        let manager = self.manager.clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let was_running = !process::find_claude_desktop().is_empty();
+                    if was_running {
+                        process::terminate_claude(Duration::from_secs(6));
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    let report = manager.sync_sessions(true).map_err(|error| error.to_string());
+                    let relaunch_error = if was_running {
+                        claude::launch(&target).err().map(|error| error.to_string())
+                    } else {
+                        None
+                    };
+                    (report, relaunch_error)
+                })
+                .await;
+
+            let _ = view.update_in(cx, |this, _window, cx| {
+                this.busy_message = None;
+                let (report, relaunch_error) = result;
+                match report {
+                    Ok(report) if report.failed > 0 => this.set_banner(
+                        BannerKind::Warning,
+                        format!(
+                            "Brought over most of your Code history, but {} file(s) could not be written. \
+                             Try again with Claude closed; details are in Activity.",
+                            report.failed
+                        ),
+                    ),
+                    Ok(report) => {
+                        let shared = this.manager.history_status().shared;
+                        let text = if report.copied + report.removed == 0 {
+                            "Code history was already the same in every account.".to_string()
+                        } else {
+                            format!(
+                                "Every account now shows the same {}. A backup was saved first.",
+                                plural(shared, "Code session", "Code sessions")
+                            )
+                        };
+                        this.set_banner(BannerKind::Success, text);
+                    }
+                    Err(error) => {
+                        if enable {
+                            this.cfg.share_sessions = false;
+                            this.cfg.save();
+                            this.reload_manager();
+                        }
+                        this.set_banner(
+                            BannerKind::Error,
+                            format!("Nothing was changed. Could not back up Code history: {error}"),
+                        );
+                    }
+                }
+                if let Some(error) = relaunch_error {
+                    this.set_banner(
+                        BannerKind::Warning,
+                        format!("History is shared, but Claude could not be reopened: {error}"),
+                    );
+                }
+                this.sync_all();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn toggle_sync_claude_code(&mut self, cx: &mut Context<Self>) {
@@ -1066,7 +1164,7 @@ impl DashboardView {
                 cx,
             ))
             .child(self.nav_item("nav-settings", "02", "Settings", ActiveTab::Settings, None, cx))
-            .child(self.nav_item("nav-data", "03", "Data", ActiveTab::Data, None, cx))
+            .child(self.nav_item("nav-data", "03", "Storage", ActiveTab::Data, None, cx))
             .child(self.nav_item("nav-activity", "04", "Activity", ActiveTab::Logs, None, cx))
             .child(div().flex_1())
             .child(
@@ -1230,8 +1328,8 @@ impl DashboardView {
         let index = self.manager.active();
         let profile = self.manager.active_profile();
         let name = profile.name.clone();
-        let dir = profile.dir.clone();
         let facts = self.facts(index);
+        let sessions = facts.sessions();
         let is_renaming = self.editing == Some(EditingField::RenameProfile(index));
         let (link_label, link_tone) = match self.cached_link() {
             LinkHealth::Healthy => ("LINKED", SUCCESS),
@@ -1278,7 +1376,7 @@ impl DashboardView {
             .id("hero")
             .flex_none()
             .relative()
-            .h(px(220.0))
+            .h(px(180.0))
             .rounded_md()
             .overflow_hidden()
             .bg(rgb(SUNKEN))
@@ -1349,37 +1447,29 @@ impl DashboardView {
                                             .text_color(rgb(TEXT_MUTED))
                                             .child(facts.detail),
                                     )
-                                    .when(facts.cli_auth, |row| row.child(tag("CLAUDE CODE", TEXT_MUTED))),
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(TEXT_FAINT))
+                                            .child(format!(
+                                                "· {}",
+                                                plural(sessions, "Code session", "Code sessions")
+                                            )),
+                                    ),
                             ),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1p5()
-                            .child(
-                                button("hero-rename", "Rename", ButtonKind::Secondary, !is_renaming)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.begin_edit(
-                                            EditingField::RenameProfile(index),
-                                            name.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                            .child(
-                                button("hero-side-by-side", "Open side by side", ButtonKind::Secondary, true)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.trigger_side_by_side(index, cx);
-                                    })),
-                            )
-                            .child(
-                                button("hero-open-folder", "Open folder", ButtonKind::Secondary, true)
-                                    .on_click(cx.listener(move |_, _, _, _| {
-                                        process::open_path(&dir);
-                                    })),
-                            ),
+                        div().flex().flex_row().child(
+                            button("hero-rename", "Rename", ButtonKind::Secondary, !is_renaming)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_edit(
+                                        EditingField::RenameProfile(index),
+                                        name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
                     ),
             )
     }
@@ -1453,6 +1543,167 @@ impl DashboardView {
                                 }),
                             ),
                         ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The one place that decides whether Code history is shared: a switch, a plain-language
+    /// status, and, when the accounts differ, a preview of what each would receive.
+    fn render_history_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let profiles = self.manager.profiles();
+        if profiles.len() < 2 {
+            return None;
+        }
+        let on = self.cfg.share_sessions;
+        let history = self.history();
+        let busy = self.busy_message.is_some();
+        let shared = plural(history.shared, "session", "sessions");
+
+        let (status, tone) = match (on, history.in_sync) {
+            (true, true) => (format!("In sync · {shared} in every account"), SUCCESS),
+            (true, false) => ("Some sessions are out of date".to_string(), WARNING),
+            (false, true) => (format!("Already the same · {shared} in every account"), TEXT_MUTED),
+            (false, false) => ("Accounts have different history".to_string(), TEXT_MUTED),
+        };
+
+        let counts = profiles.iter().enumerate().map(|(index, profile)| {
+            let have = self.facts(index).sessions();
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .child(status_dot(account_hex(index)))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(format!("{} · {have}", profile.name)),
+                )
+        });
+
+        let preview = (self.history_confirm && !on).then(|| {
+            let lines = profiles.iter().enumerate().map(|(index, profile)| {
+                let have = self.facts(index).sessions();
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .text_xs()
+                    .child(
+                        div()
+                            .w(px(180.0))
+                            .flex_none()
+                            .truncate()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(profile.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family(MONO)
+                            .text_color(rgb(if have == history.shared { TEXT_FAINT } else { TEXT }))
+                            .child(format!("{have} → {}", history.shared)),
+                    )
+            });
+            let closes = if self.claude_pids > 0 {
+                " Claude Desktop will close and reopen."
+            } else {
+                ""
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_4()
+                .py_3()
+                .border_t_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(SUNKEN))
+                .child(caption("WHAT WILL HAPPEN"))
+                .children(lines)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(format!(
+                            "Sessions are only added. Nothing is removed, and a backup is saved first.{closes}"
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_1p5()
+                        .child(
+                            button("history-confirm", "Bring over", ButtonKind::Primary, !busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.trigger_history_sync(true, window, cx);
+                                })),
+                        )
+                        .child(
+                            button("history-cancel", "Cancel", ButtonKind::Ghost, true).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.history_confirm = false;
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
+                )
+        });
+
+        Some(
+            section("Code history")
+                .child(
+                    panel()
+                        .child(
+                            setting_row(
+                                true,
+                                "Same Code history in every account",
+                                "Chats on claude.ai and Projects stay with each account.",
+                            )
+                            .child(toggle("btn-toggle-history", on).on_click(
+                                cx.listener(|this, _, _, cx| this.toggle_history(cx)),
+                            )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                .px_4()
+                                .py_3()
+                                .border_t_1()
+                                .border_color(rgb(BORDER))
+                                .child(status_dot(tone))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(if tone == TEXT_MUTED { TEXT } else { tone }))
+                                        .child(status),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_row()
+                                        .flex_wrap()
+                                        .justify_end()
+                                        .gap_x_3()
+                                        .children(counts),
+                                )
+                                .when(on && !history.in_sync, |row| {
+                                    row.child(
+                                        button("history-sync-now", "Sync now", ButtonKind::Secondary, !busy)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.trigger_history_sync(false, window, cx);
+                                            })),
+                                    )
+                                }),
+                        )
+                        .children(preview),
                 )
                 .into_any_element(),
         )
@@ -1538,7 +1789,11 @@ impl DashboardView {
                                 .truncate()
                                 .text_xs()
                                 .text_color(rgb(TEXT_MUTED))
-                                .child(facts.detail),
+                                .child(format!(
+                                    "{} · {}",
+                                    facts.detail,
+                                    plural(facts.sessions(), "Code session", "Code sessions")
+                                )),
                         ),
                 )
                 .child(
@@ -1714,10 +1969,7 @@ impl DashboardView {
         page("accounts-scroll")
             .child(self.render_hero(cx))
             .children(self.render_link_callout(cx))
-            .child(
-                section("Data in this account")
-                    .child(panel().px_4().py_3().child(contents_view(&self.facts(active_idx)))),
-            )
+            .children(self.render_history_panel(cx))
             .child(
                 div()
                     .flex_none()
@@ -1766,7 +2018,6 @@ impl DashboardView {
         let autostart = self.autostart_enabled;
         let share_mcp = self.cfg.share_mcp_config;
         let sync_cli = self.cfg.sync_claude_code;
-        let share_sessions = self.cfg.share_sessions;
         let launch = self.cfg.launch.clone().unwrap_or_default();
         let live_override = self.cfg.live_override.clone().unwrap_or_default();
         let busy = self.busy_message.is_some();
@@ -1785,7 +2036,7 @@ impl DashboardView {
         page("settings-scroll")
             .child(page_header(
                 "Settings",
-                "Changes are saved to config.json immediately.",
+                "Changes save as you make them.",
             ))
             .child(
                 section("General").child(
@@ -1804,17 +2055,13 @@ impl DashboardView {
                 ),
             )
             .child(
-                section("Shared between accounts").child(
+                section("Keep the same in every account").child(
                     panel()
                         .child(
                             setting_row(
                                 true,
                                 "MCP servers and desktop config",
-                                "Copy the newest claude_desktop_config.json to every account on switch.",
-                            )
-                            .child(
-                                button("btn-sync-mcp-now", "Sync now", ButtonKind::Secondary, true)
-                                    .on_click(cx.listener(|this, _, _, cx| this.sync_mcp_now(cx))),
+                                "Every account uses your newest MCP servers and app preferences.",
                             )
                             .child(toggle("btn-toggle-share-mcp", share_mcp).on_click(
                                 cx.listener(|this, _, _, cx| this.toggle_share_mcp_config(cx)),
@@ -1823,38 +2070,54 @@ impl DashboardView {
                         .child(
                             setting_row(
                                 false,
-                                "Claude Code CLI sign-in",
-                                "Swap ~/.claude credentials along with the desktop account.",
-                            )
-                            .child(
-                                button("btn-snapshot-cli-now", "Save current", ButtonKind::Secondary, true)
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.snapshot_cli_auth_now(cx)),
-                                    ),
+                                "Claude Code sign-in",
+                                "Switch the Claude Code CLI login together with the account.",
                             )
                             .child(toggle("btn-toggle-sync-cli", sync_cli).on_click(cx.listener(
                                 |this, _, _, cx| this.toggle_sync_claude_code(cx),
                             ))),
-                        )
-                        .child(
-                            setting_row(
-                                false,
-                                "Code sessions",
-                                "Show the same Code session list under every account. Chats on claude.ai stay per account.",
-                            )
-                            .child(
-                                button("btn-sync-sessions-now", "Sync now", ButtonKind::Secondary, true)
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.sync_sessions_now(cx)),
-                                    ),
-                            )
-                            .child(toggle("btn-toggle-share-sessions", share_sessions).on_click(
-                                cx.listener(|this, _, _, cx| this.toggle_share_sessions(cx)),
-                            )),
                         ),
                 ),
             )
             .child(
+                div().flex_none().flex().flex_row().child(
+                    button(
+                        "btn-toggle-advanced",
+                        if self.show_advanced { "Hide advanced" } else { "Advanced" },
+                        ButtonKind::Ghost,
+                        true,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_advanced = !this.show_advanced;
+                        cx.notify();
+                    })),
+                ),
+            )
+            .when(self.show_advanced, |page| {
+                page.child(
+                    section("Run by hand").child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                button("btn-sync-mcp-now", "Copy MCP config now", ButtonKind::Secondary, true)
+                                    .on_click(cx.listener(|this, _, _, cx| this.sync_mcp_now(cx))),
+                            )
+                            .child(
+                                button(
+                                    "btn-snapshot-cli-now",
+                                    "Save current Claude Code login",
+                                    ButtonKind::Secondary,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.snapshot_cli_auth_now(cx))),
+                            ),
+                    ),
+                )
+            })
+            .when(self.show_advanced, |page| page.child(
                 section("Claude Desktop").child(
                     panel()
                         .child(
@@ -1937,8 +2200,8 @@ impl DashboardView {
                                 ),
                         ),
                 ),
-            )
-            .child(
+            ))
+            .when(self.show_advanced, |page| page.child(
                 section("Files").child(
                     div()
                         .flex()
@@ -1972,7 +2235,7 @@ impl DashboardView {
                             ),
                         ),
                 ),
-            )
+            ))
     }
 
     #[allow(clippy::too_many_arguments)]

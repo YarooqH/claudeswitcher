@@ -136,6 +136,34 @@ pub fn plan(profiles: &[PathBuf], known_folders: &[(String, String)]) -> Plan {
     plan
 }
 
+/// How many distinct sessions exist across all profiles, not counting deleted ones. This is
+/// how many every account would show once the lists are shared.
+pub fn live_count(profiles: &[PathBuf]) -> usize {
+    let mut live: BTreeSet<String> = BTreeSet::new();
+    let mut deleted: BTreeSet<String> = BTreeSet::new();
+    for profile in profiles {
+        let root = profile.join(SESSIONS_DIR);
+        for account in subdirs(&root) {
+            for org in subdirs(&root.join(&account)) {
+                let Ok(entries) = fs::read_dir(root.join(&account).join(&org)) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let Ok(name) = entry.file_name().into_string() else {
+                        continue;
+                    };
+                    if let Some(id) = name.strip_prefix(DELETED_PREFIX) {
+                        deleted.insert(id.to_string());
+                    } else if let Some(id) = session_id(&name) {
+                        live.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    live.difference(&deleted).count()
+}
+
 /// Carries out a plan. Best effort: one locked file must not stop the rest, and a
 /// file that fails is simply picked up by the next sync.
 pub fn apply(plan: &Plan) -> Report {
@@ -226,7 +254,7 @@ fn prune(backups_root: &Path, keep: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, backup, plan, SESSIONS_DIR};
+    use super::{apply, backup, live_count, plan, SESSIONS_DIR};
     use std::fs::{self, File};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
@@ -279,6 +307,46 @@ mod tests {
         }
         // Copies keep their timestamps, so a second pass has nothing left to do.
         assert!(plan(&[one, two], &[]).is_empty());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_empty_account_adds_to_a_full_one_and_never_takes_from_it() {
+        let base = scratch("empty");
+        let (full, empty) = (base.join("full"), base.join("empty"));
+        for id in 0..5 {
+            put(&full, "acctA", "org1", &format!("local_{id}.json"), "x");
+        }
+        put(&empty, "acctB", "org1", "keep.txt", "unrelated");
+
+        let profiles = [full.clone(), empty.clone()];
+        assert_eq!(live_count(&profiles), 5);
+        let first = plan(&profiles, &[]);
+        assert!(first.removals.is_empty());
+        apply(&first);
+
+        for id in 0..5 {
+            let name = format!("local_{id}.json");
+            assert!(read(&full, "acctA", "org1", &name).is_some());
+            assert!(read(&empty, "acctA", "org1", &name).is_some());
+            assert!(read(&empty, "acctB", "org1", &name).is_some());
+        }
+        assert_eq!(live_count(&profiles), 5);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn different_sessions_in_two_accounts_add_up_and_shared_ones_count_once() {
+        let base = scratch("count");
+        let (one, two) = (base.join("one"), base.join("two"));
+        put(&one, "acctA", "org1", "local_a.json", "1");
+        put(&one, "acctA", "org1", "local_shared.json", "1");
+        put(&two, "acctB", "org1", "local_shared.json", "2");
+        put(&two, "acctB", "org1", "local_b.json", "2");
+        put(&two, "acctB", "org1", "local_gone.json", "2");
+        put(&one, "acctA", "org1", "deleted_gone", "1");
+
+        assert_eq!(live_count(&[one, two]), 3);
         let _ = fs::remove_dir_all(&base);
     }
 

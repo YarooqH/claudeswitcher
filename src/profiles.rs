@@ -268,6 +268,14 @@ pub struct ProfileContents {
     pub cli_email: Option<String>,
 }
 
+/// How the Code history of all accounts compares.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HistoryStatus {
+    /// Sessions every account would show once the lists are shared.
+    pub shared: usize,
+    pub in_sync: bool,
+}
+
 const RECENT_TITLES: usize = 3;
 
 impl Profile {
@@ -738,10 +746,7 @@ impl ProfileManager {
         )
     }
 
-    /// Mirrors the Code session lists across all profiles (see `sessions`). Claude must be
-    /// closed. With `backup` the lists are snapshotted first, but only when something would
-    /// change; if that snapshot fails nothing is touched.
-    pub fn sync_sessions(&self, backup: bool) -> io::Result<sessions::Report> {
+    fn session_plan(&self) -> sessions::Plan {
         // Accounts known only from a CLI snapshot have no session folder yet; seed it so a
         // login to one of them shows the shared list on first launch.
         let known_folders: Vec<(String, String)> = self
@@ -750,7 +755,23 @@ impl ProfileManager {
             .filter_map(Profile::cli_account)
             .filter_map(|cli| Some((cli.account_uuid?, cli.org_uuid?)))
             .collect();
-        let plan = sessions::plan(&self.profile_dirs(), &known_folders);
+        sessions::plan(&self.profile_dirs(), &known_folders)
+    }
+
+    /// Whether every account already shows the same Code history, and how long that list is.
+    /// Reads every session folder, so callers should cache it.
+    pub fn history_status(&self) -> HistoryStatus {
+        HistoryStatus {
+            shared: sessions::live_count(&self.profile_dirs()),
+            in_sync: self.session_plan().is_empty(),
+        }
+    }
+
+    /// Mirrors the Code session lists across all profiles (see `sessions`). Claude must be
+    /// closed. With `backup` the lists are snapshotted first, but only when something would
+    /// change; if that snapshot fails nothing is touched.
+    pub fn sync_sessions(&self, backup: bool) -> io::Result<sessions::Report> {
+        let plan = self.session_plan();
         if plan.is_empty() {
             return Ok(sessions::Report::default());
         }

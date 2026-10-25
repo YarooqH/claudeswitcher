@@ -72,16 +72,22 @@ directory, so each account normally sees only its own list. The conversations
 themselves live in `~/.claude/projects`, which every account already shares; only
 these small index files are per account.
 
-Turn on **Settings & Paths ▸ Shared between accounts ▸ Code sessions** and the app
-mirrors the index files so every login shows the same history:
+On the **Accounts** page, turn on **Code history ▸ Same Code history in every account**.
+If the accounts differ, the app first shows what each one will receive (for example
+`painted secret  0 → 48`) and asks before anything is copied; it closes Claude Desktop,
+backs up, syncs and reopens it for you. The app then mirrors the index files so every
+login shows the same history:
+
+- Sync only adds. An account with no sessions can never empty one that has many; two
+  accounts with different sessions both end up with all of them.
 
 - The newest copy of each session wins; a session deleted in one account (Desktop
   leaves a `deleted_<id>` marker) is removed from all of them and never comes back.
 - Account folders that exist in any profile are created in all of them, so signing
   in to an account that has not opened Code yet already shows the shared list.
-- It runs on every switch while the toggle is on. **Sync now** runs it on demand;
-  close Claude Desktop first, since Desktop is not expecting files to appear in its
-  folders.
+- It runs on every switch while the toggle is on. When new sessions have appeared in
+  one account, **Sync now** appears next to the status and does the same close, sync and
+  reopen on demand.
 - Before anything is written, every profile's session list is copied to
   `%APPDATA%\ClaudeSyncTray\backups\auto-sessions-<timestamp>`. The newest 10 of
   these are kept; backups you made by hand are never pruned. A switch also takes this
@@ -89,11 +95,11 @@ mirrors the index files so every login shows the same history:
 - Not shared: Claude.ai chat history (server-side, per account), Cowork sessions
   (`local-agent-mode-sessions`) and scheduled tasks.
 
-### Copying data between accounts (Data tab)
+### Copying data between accounts (Storage tab)
 
 An account folder holds a lot more than settings: the Linux sandbox (`vm_bundles`,
 `claude-code-vm`) alone is around 11 GB, plus the Claude Code CLI builds and several
-browser caches. The **Data** tab lists every top-level folder of the selected account,
+browser caches. The **Storage** tab lists every top-level folder of the selected account,
 what it is for (sign-in, settings, history, sandbox, cache), and its size, so you can see
 where the space goes.
 
@@ -149,9 +155,9 @@ before enabling *Start with Windows*, since the autostart entry stores the exe p
 Run it — the **GPUI Dashboard** opens alongside a color-coded **System Tray icon**:
 
 - **Dashboard tabs:**
-  - **Profiles & Accounts:** Switch accounts (with or without relaunching Claude), add new profiles, rename or remove profiles inline, inspect session data status, and open profile folders.
-  - **Settings & Paths:** Toggle *Start with Windows*, browse or override `claude.exe`, configure `live_override` or custom launch commands, and open quick folder shortcuts.
-  - **Data:** See what each account folder contains and how big it is, copy data between accounts (one-click minimal or a detailed per-folder view), and share one Linux sandbox between accounts.
+  - **Accounts:** Switch accounts, add, rename or remove them, see each account's email and Code session count, and keep the Code history the same in every account with one switch.
+  - **Settings:** *Start with Windows* and what to keep the same in every account. Under **Advanced**: manual sync buttons, `claude.exe` and launch overrides, `live_override`, and folder shortcuts.
+  - **Storage:** See what each account folder contains and how big it is, copy data between accounts (one-click minimal or a detailed per-folder view), and share one Linux sandbox between accounts.
   - **Activity Log:** Inspect, refresh, or clear `claude-sync-tray.log` in real time.
 - **System Tray:**
   - **Left-click** the tray icon to toggle the GPUI dashboard window.

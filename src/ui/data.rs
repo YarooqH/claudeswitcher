@@ -447,8 +447,8 @@ impl DashboardView {
 
         page("data-scroll")
             .child(page_header(
-                "Data",
-                "What each account folder holds, and what moves between accounts.",
+                "Storage",
+                "Where each account's disk space goes, and how to copy data between accounts.",
             ))
             .child(
                 div()
