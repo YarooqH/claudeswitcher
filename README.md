@@ -137,6 +137,10 @@ cargo build --release
 # -> target\release\claude-sync-tray.exe
 ```
 
+While developing, `powershell -File tools\dev.ps1` rebuilds in place even when the tray
+is running (Windows can rename a running exe but not overwrite it), then restarts it.
+Add `-NoRun` to only build.
+
 Optionally copy the exe somewhere permanent (e.g. `%LOCALAPPDATA%\Programs\ClaudeSyncTray\`)
 before enabling *Start with Windows*, since the autostart entry stores the exe path.
 
