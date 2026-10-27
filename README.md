@@ -3,8 +3,8 @@
 <h1 align="center">ClaudeSyncTray</h1>
 
 <p align="center">
-  Use several Claude Desktop accounts on one Windows PC without logging out and in again.<br>
-  A small tray app and dashboard that gives each account its own data folder and switches between them in a click.
+  Keep several Claude Desktop accounts on one Windows PC, each with its own sign-in and data.<br>
+  A small tray app and dashboard that gives every account its own folder and switches between them in a click.
 </p>
 
 <p align="center">
