@@ -1,0 +1,54 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please don't paste account emails, tokens or anything from
+        `claude_code_auth`. The log file can contain paths, so skim it before attaching.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the Accounts page
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How is Claude Desktop installed?
+      options:
+        - Microsoft Store package
+        - Classic installer
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ClaudeSyncTray version
+      description: Shown next to the name in the title bar, or the commit you built.
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 23H2
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The relevant lines from the Activity page or `%APPDATA%\ClaudeSyncTray\claude-sync-tray.log`.
+      render: text
