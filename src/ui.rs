@@ -1141,7 +1141,6 @@ impl DashboardView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.busy_message.is_some();
         let running = self.claude_pids > 0;
-        let active_idx = self.manager.active();
         let active_name = self.manager.active_profile().name.clone();
         let profile_count = self.manager.profiles().len();
 
@@ -1173,37 +1172,16 @@ impl DashboardView {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(caption("CLAUDE DESKTOP"))
+                    .child(caption("ACTIVE ACCOUNT"))
                     .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(status_dot(if running { SUCCESS } else { TEXT_FAINT }))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(TEXT))
-                                    .child(if running { "Running" } else { "Not running" }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(status_dot(account_hex(active_idx)))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .child(active_name),
-                            ),
+                            .w_full()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child(shorten(&active_name, 18)),
                     )
                     .child(
                         div()
@@ -1331,10 +1309,10 @@ impl DashboardView {
         let facts = self.facts(index);
         let sessions = facts.sessions();
         let is_renaming = self.editing == Some(EditingField::RenameProfile(index));
-        let (link_label, link_tone) = match self.cached_link() {
-            LinkHealth::Healthy => ("LINKED", SUCCESS),
-            LinkHealth::NotLinked => ("NOT LINKED", WARNING),
-            LinkHealth::Broken => ("LINK BROKEN", DANGER),
+        let link_problem = match self.cached_link() {
+            LinkHealth::Healthy => None,
+            LinkHealth::NotLinked => Some(("NOT LINKED", WARNING)),
+            LinkHealth::Broken => Some(("LINK BROKEN", DANGER)),
         };
 
         let title = if is_renaming {
@@ -1354,13 +1332,7 @@ impl DashboardView {
                 )
                 .into_any_element()
         } else {
-            // GPUI's ellipsis truncation collapses large text to "…", so clip and
-            // shorten by hand instead.
-            let shown: String = if name.chars().count() > 26 {
-                name.chars().take(25).chain(std::iter::once('…')).collect()
-            } else {
-                name.to_string()
-            };
+            let shown = shorten(&name, 26);
             div()
                 .w_full()
                 .overflow_hidden()
@@ -1404,7 +1376,8 @@ impl DashboardView {
                             .items_center()
                             .justify_between()
                             .child(caption(format!("ACTIVE ACCOUNT · {:02}", index + 1)))
-                            .child(
+                            // A healthy link is the normal state and needs no badge.
+                            .children(link_problem.map(|(label, tone)| {
                                 div()
                                     .flex()
                                     .flex_row()
@@ -1416,15 +1389,15 @@ impl DashboardView {
                                     .bg(rgba((BG << 8) | 0xd9))
                                     .border_1()
                                     .border_color(rgb(BORDER))
-                                    .child(status_dot(link_tone))
+                                    .child(status_dot(tone))
                                     .child(
                                         div()
                                             .font_family(MONO)
                                             .text_xs()
-                                            .text_color(rgb(link_tone))
-                                            .child(link_label),
-                                    ),
-                            ),
+                                            .text_color(rgb(tone))
+                                            .child(label),
+                                    )
+                            })),
                     )
                     .child(
                         div()
@@ -2737,6 +2710,16 @@ fn time_ago(ms: u64) -> String {
         60..=3599 => format!("{}m ago", seconds / 60),
         3600..=86399 => format!("{}h ago", seconds / 3600),
         _ => format!("{}d ago", seconds / 86400),
+    }
+}
+
+/// Cuts `text` to `max` characters with a trailing ellipsis. GPUI's own truncation collapses
+/// larger text to just "…", so long names are shortened by hand.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() > max {
+        text.chars().take(max - 1).chain(std::iter::once('…')).collect()
+    } else {
+        text.to_string()
     }
 }
 

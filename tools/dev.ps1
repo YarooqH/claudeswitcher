@@ -16,7 +16,11 @@ if (-not $vs) { throw 'Visual Studio Build Tools not found (needs the C++ worklo
 $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
 $env:PATH = "$(Split-Path -Parent $vswhere);$env:PATH"
 
-if (Test-Path $old) { Remove-Item $old -Force -ErrorAction SilentlyContinue }
+# A copy renamed on an earlier run may still be running (and so locked); sweep what can be
+# deleted and give this one a name of its own so a leftover never blocks the rename.
+Get-ChildItem (Split-Path -Parent $exe) -Filter '*.old' -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+$old = "$exe.$(Get-Date -Format 'HHmmss').old"
 if (Test-Path $exe) { Rename-Item $exe $old -Force }
 
 Push-Location $root
